@@ -1,0 +1,182 @@
+name: Build and Deploy
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+      branches:
+        - main
+
+jobs:
+  detect-secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Run secrets check
+        run: ./scripts/detect-secrets/secrets-check-all
+
+  deploy-nightly-beta:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Deploy betas
+        run: ./scripts/deploys/deploy-beta-both
+
+  check-and-deploy:
+    runs-on: ubuntu-latest
+    env:
+      BUNDLE_PATH: .vendor
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.9.0"
+      - name: Install dependencies
+        run: yarn install
+      - name: Determine Deployment Type
+        run: ./scripts/codepush/determine-deployment-type.sh
+      - name: Handle Deployment for beta
+        run: |
+          if [ "$DEPLOYMENT_TYPE" == "beta" ]; then
+            echo "Native code changed, new beta needed!"
+            ./scripts/codepush/maybe_notify_beta_needed.sh
+            exit 1
+          fi
+      - name: Install CodePush CLI
+        run: yarn global add appcenter-cli
+      - name: Trigger CodePush deployment
+        run: ./scripts/codepush/deploy-to-codepush.sh Staging
+
+  test-js:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20.9.0]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Install dependencies
+        run: yarn install
+      - name: Run Jest tests
+        run: yarn jest --ci --forceExit --logHeapUsage --runInBand --reporters=default --reporters=jest-junit --shard=${{ matrix.node-index + 1 }}/${{ matrix.node-total }}
+      - name: Upload test results
+        uses: actions/upload-artifact@v2
+        with:
+          name: jest-reports
+          path: ./reports/junit/
+
+  update-metaphysics:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Generate checksums
+        run: ./scripts/ci/generate-manifest.js .manifests/node_modules '^yarn\.lock$' '^patches/' '^package\.json$'
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.9.0"
+      - name: Install dependencies
+        run: yarn install
+      - name: Run Relay compiler
+        run: yarn relay
+      - name: Generate query map
+        run: yarn relay
+      - name: Update metaphysics
+        run: yarn update-metaphysics
+
+  check-code:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Install dependencies
+        run: yarn install
+      - name: Run type-check
+        run: yarn type-check
+      - name: Check Branch and Exit Early if Ignored
+        run: |
+          if [[ "$CIRCLE_BRANCH" == "main" || "$CIRCLE_BRANCH" == "beta-ios" || "$CIRCLE_BRANCH" == "beta-android" ]]; then
+            echo "On ignored branch ($CIRCLE_BRANCH). Exiting early."
+            exit 0
+          fi
+      - name: Danger
+        run: yarn danger ci --verbose
+
+  check-flags:
+    runs-on: macos-latest
+    env:
+      BUNDLE_PATH: .vendor
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Generate checksums
+        run: ./scripts/ci/generate-manifest.js .manifests/node_modules '^yarn\.lock$' '^patches/' '^package\.json$'
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.9.0"
+      - name: Install dependencies
+        run: yarn install
+      - name: Check flags
+        run: ./scripts/check-flags/biweekly-flag-check.sh
+
+  build-test-js:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Generate checksums
+        run: ./scripts/ci/generate-manifest.js .manifests/node_modules '^yarn\.lock$' '^patches/' '^package\.json$'
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.9.0"
+      - name: Install dependencies
+        run: yarn install
+      - name: Run Relay compiler
+        run: yarn relay
+      - name: Check generated folder
+        run: |
+          if test "$(git diff -- src/__generated__)"; then
+            echo 'You forgot to run `yarn relay` before committing'
+            exit 1
+          fi
+      - name: Generate app_build manifest
+        run: ./scripts/ci/generate-manifest.js .manifests/app_build '^\./manifests/native_code' '^dist/'
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: manifest-artifacts
+          path: .manifests
+
+  build-test-app-ios:
+    runs-on: macos-latest
+    needs: build-test-js
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+      - name: Generate checksums
+        run: ./scripts/ci/generate-manifest.js .manifests/node_modules '^yarn\.lock$' '^patches/' '^package\.json$'
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.9.0"
+      - name: Install dependencies
+        run: yarn install
+      - name: Run Relay compiler
+        run: yarn relay
+      - name: Install Cocoapods
+        run: cd ios && bundle exec pod check --ignore-dev-pods || bundle exec pod install && cd ..
+      - name: Build App
+        run: ./scripts/ci/ci-ios
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
